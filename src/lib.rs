@@ -107,6 +107,16 @@ fn gpg_err(e: gpgme::Error) -> Error {
     Error::Gpg(Box::new(e))
 }
 
+/// Parse a `.gpg-id` file's contents into its non-empty, trimmed id lines.
+fn parse_gpg_ids(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A handle to a password store on disk.
@@ -191,7 +201,7 @@ impl PasswordStore {
         self.insert_with(&mut ctx, name, contents)
     }
 
-    fn show_with(&self, ctx: &mut gpgme::Context, name: &str) -> Result<String> {
+    fn decrypt_raw(&self, ctx: &mut gpgme::Context, name: &str) -> Result<Zeroizing<Vec<u8>>> {
         let path = self.entry_path(name)?;
         let ciphertext = fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Error::NotFound(name.to_owned()),
@@ -199,20 +209,21 @@ impl PasswordStore {
         })?;
         let mut plaintext = Zeroizing::new(Vec::new());
         ctx.decrypt(&ciphertext, &mut *plaintext).map_err(gpg_err)?;
+        Ok(plaintext)
+    }
+
+    fn show_with(&self, ctx: &mut gpgme::Context, name: &str) -> Result<String> {
+        let plaintext = self.decrypt_raw(ctx, name)?;
         let text = std::str::from_utf8(&plaintext).map_err(Error::Utf8)?;
         Ok(text.to_owned())
     }
 
-    fn insert_with(&self, ctx: &mut gpgme::Context, name: &str, contents: &str) -> Result<()> {
-        let path = self.entry_path(name)?;
-        let parent = path.parent().expect("entry path always has a parent");
-        let ids = self.gpg_ids_for(parent)?;
-
+    fn keys_for_ids(&self, ctx: &mut gpgme::Context, ids: &[String]) -> Result<Vec<gpgme::Key>> {
         // Looked up per id, not batched via find_keys: a batched lookup
         // cannot attribute matches to patterns, so a missing recipient
         // would silently encrypt to fewer keys than .gpg-id demands.
         let mut keys = Vec::with_capacity(ids.len());
-        for id in &ids {
+        for id in ids {
             let key = ctx.get_key(id.as_str()).map_err(|e| {
                 // gpgme reports an absent key as EOF; anything else (agent
                 // down, corrupt keyring) is a real gpg failure.
@@ -224,9 +235,19 @@ impl PasswordStore {
             })?;
             keys.push(key);
         }
+        Ok(keys)
+    }
 
+    fn write_encrypted(
+        &self,
+        ctx: &mut gpgme::Context,
+        keys: &[gpgme::Key],
+        plaintext: &[u8],
+        path: &Path,
+    ) -> Result<()> {
+        let parent = path.parent().expect("entry path always has a parent");
         let mut ciphertext = Vec::new();
-        ctx.encrypt(&keys, contents, &mut ciphertext)
+        ctx.encrypt(keys, plaintext, &mut ciphertext)
             .map_err(gpg_err)?;
         fs::create_dir_all(parent)?;
         // Atomic replace: write a temp file (created 0o600) in the same
@@ -234,8 +255,16 @@ impl PasswordStore {
         // can never truncate an existing entry.
         let tmp = tempfile::NamedTempFile::new_in(parent)?;
         fs::write(tmp.path(), &ciphertext)?;
-        tmp.persist(&path).map_err(|e| Error::Io(e.error))?;
+        tmp.persist(path).map_err(|e| Error::Io(e.error))?;
         Ok(())
+    }
+
+    fn insert_with(&self, ctx: &mut gpgme::Context, name: &str, contents: &str) -> Result<()> {
+        let path = self.entry_path(name)?;
+        let parent = path.parent().expect("entry path always has a parent");
+        let ids = self.gpg_ids_for(parent)?;
+        let keys = self.keys_for_ids(ctx, &ids)?;
+        self.write_encrypted(ctx, &keys, contents.as_bytes(), &path)
     }
 
     /// Delete an entry from the store.
@@ -421,12 +450,7 @@ impl PasswordStore {
             let gpg_id = current.join(".gpg-id");
             match fs::read_to_string(&gpg_id) {
                 Ok(contents) => {
-                    let ids: Vec<String> = contents
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_owned)
-                        .collect();
+                    let ids = parse_gpg_ids(&contents);
                     if !ids.is_empty() {
                         return Ok(ids);
                     }
