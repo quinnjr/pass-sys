@@ -86,5 +86,5 @@ Single-file library (`src/lib.rs`). The important structure:
   `std::str::from_utf8`).
 - Behavior must match `pass` semantics wherever a counterpart exists;
   deviations are documented in README's "Semantics" section and CHANGES.md.
-  Known intentional gaps: no git integration, no extensions, no
-  re-encryption of existing entries on `init`, UTF-8-only entry contents.
+  Known intentional gaps: no git integration, no extensions, UTF-8-only
+  entry contents.
