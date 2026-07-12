@@ -32,11 +32,8 @@ the test suite proves interoperability in both directions against the real
 
 ## Installation
 
-Not yet published to crates.io. Until then, use a git dependency:
-
-```toml
-[dependencies]
-pass-sys = { git = "https://github.com/quinnjr/pass-sys", branch = "main" }
+```sh
+cargo add pass-sys
 ```
 
 ### Requirements
