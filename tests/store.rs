@@ -636,3 +636,72 @@ fn doc_example_flow_works_end_to_end() {
     );
     assert_eq!(s.list().unwrap(), vec!["web/example.com"]);
 }
+
+#[test]
+fn init_does_not_cross_gpg_id_domains() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    std::fs::create_dir_all(f.store_dir().join("sub")).unwrap();
+    std::fs::write(
+        f.store_dir().join("sub/.gpg-id"),
+        format!("{TEST_KEY_ID_2}\n"),
+    )
+    .unwrap();
+    s.insert("root-entry", "a\n").unwrap();
+    s.insert("sub/entry", "b\n").unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init root");
+    assert_eq!(
+        f.recipient_keyids("root-entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "root domain must be re-encrypted"
+    );
+    assert_eq!(
+        f.recipient_keyids("sub/entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "sub domain has its own .gpg-id and must NOT be touched — same key here, so assert via file bytes instead"
+    );
+}
+
+#[test]
+fn init_skips_subfolder_with_own_gpg_id_but_covers_empty_one() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    // own domain: must not be rewritten by root re-init
+    std::fs::create_dir_all(f.store_dir().join("own")).unwrap();
+    std::fs::write(
+        f.store_dir().join("own/.gpg-id"),
+        format!("{TEST_KEY_ID}\n"),
+    )
+    .unwrap();
+    s.insert("own/entry", "a\n").unwrap();
+    // empty .gpg-id: governed by root, must be rewritten
+    std::fs::create_dir_all(f.store_dir().join("empty")).unwrap();
+    std::fs::write(f.store_dir().join("empty/.gpg-id"), "\n").unwrap();
+    s.insert("empty/entry", "b\n").unwrap();
+
+    let own_before = std::fs::read(f.store_dir().join("own/entry.gpg")).unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init root");
+    let own_after = std::fs::read(f.store_dir().join("own/entry.gpg")).unwrap();
+
+    assert_eq!(own_before, own_after, "own-domain entry must be untouched");
+    assert_eq!(
+        f.recipient_keyids("empty/entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "empty .gpg-id folder is governed by the root and must be re-encrypted"
+    );
+}
+
+#[test]
+fn init_reencrypts_non_utf8_entries() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    f.encrypt_raw("binary", &[0xff, 0xfe, 0x00, 0x80]);
+    s.init(&[TEST_KEY_ID_2]).expect("re-init with binary entry");
+    assert_eq!(
+        f.recipient_keyids("binary"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+}
