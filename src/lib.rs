@@ -63,6 +63,8 @@ pub enum Error {
     KeyNotFound(String),
     /// The entry name would resolve outside the password store.
     SneakyPath(String),
+    /// `init` was called with no usable GPG ids.
+    NoGpgIds,
 }
 
 impl fmt::Display for Error {
@@ -81,6 +83,7 @@ impl fmt::Display for Error {
             }
             Error::KeyNotFound(id) => write!(f, "no GPG key found for id {id}"),
             Error::SneakyPath(name) => write!(f, "entry name {name} escapes the password store"),
+            Error::NoGpgIds => write!(f, "no GPG ids given: a store needs at least one recipient"),
         }
     }
 }
@@ -176,10 +179,15 @@ impl PasswordStore {
     /// like `pass init`. All new ids must resolve to keys before anything
     /// is modified. Entries are re-encrypted one at a time (each write
     /// atomic) and `.gpg-id` is written last, so an interrupted run is
-    /// fully repaired by running `init` again with the same ids.
+    /// repaired by running `init` again with the same ids (provided a
+    /// secret key for one of the new ids is available to decrypt the
+    /// already-converted entries).
     pub fn init(&self, gpg_ids: &[&str]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let new_ids: Vec<String> = gpg_ids.iter().map(|id| id.to_string()).collect();
+        let new_ids: Vec<String> = gpg_ids.iter().map(|id| id.trim().to_owned()).collect();
+        if new_ids.is_empty() || new_ids.iter().any(String::is_empty) {
+            return Err(Error::NoGpgIds);
+        }
         let old_ids = self.root_gpg_ids()?;
         fs::create_dir_all(&self.store_dir)?;
         fs::set_permissions(&self.store_dir, fs::Permissions::from_mode(0o700))?;

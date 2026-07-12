@@ -650,6 +650,7 @@ fn init_does_not_cross_gpg_id_domains() {
     .unwrap();
     s.insert("root-entry", "a\n").unwrap();
     s.insert("sub/entry", "b\n").unwrap();
+    let sub_before = std::fs::read(f.store_dir().join("sub/entry.gpg")).unwrap();
     s.init(&[TEST_KEY_ID_2]).expect("re-init root");
     assert_eq!(
         f.recipient_keyids("root-entry"),
@@ -661,6 +662,8 @@ fn init_does_not_cross_gpg_id_domains() {
         vec![f.encryption_keyid(TEST_KEY_ID_2)],
         "sub domain has its own .gpg-id and must NOT be touched — same key here, so assert via file bytes instead"
     );
+    let sub_after = std::fs::read(f.store_dir().join("sub/entry.gpg")).unwrap();
+    assert_eq!(sub_before, sub_after, "sub-domain entry must be untouched");
 }
 
 #[test]
@@ -715,4 +718,40 @@ fn reencrypted_entries_are_readable_by_pass() {
     s.init(&[TEST_KEY_ID_2]).unwrap();
     let shown = f.pass_cli(&["show", "interop"]).expect("pass show");
     assert_eq!(shown, "hunter2\n");
+}
+
+#[test]
+fn init_with_no_usable_ids_is_rejected() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let entry_before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    for ids in [&[][..], &[""][..], &["   "][..]] {
+        let err = s.init(ids).unwrap_err();
+        assert!(
+            matches!(err, pass_sys::Error::NoGpgIds),
+            "expected NoGpgIds for {ids:?}, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "no GPG ids given: a store needs at least one recipient"
+        );
+    }
+    let gpg_id = std::fs::read_to_string(f.store_dir().join(".gpg-id")).unwrap();
+    assert_eq!(gpg_id.trim(), TEST_KEY_ID, ".gpg-id must be unchanged");
+    let entry_after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(entry_before, entry_after, "entries must be unchanged");
+}
+
+#[test]
+fn init_reencrypts_to_multiple_ids() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    s.init(&[TEST_KEY_ID, TEST_KEY_ID_2])
+        .expect("re-init to two ids");
+    let recipients = f.recipient_keyids("entry");
+    assert!(recipients.contains(&f.encryption_keyid(TEST_KEY_ID)));
+    assert!(recipients.contains(&f.encryption_keyid(TEST_KEY_ID_2)));
 }
