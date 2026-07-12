@@ -1,0 +1,19 @@
+[package]
+name = "pass-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Integration with pass, the standard unix password manager"
+repository = "https://github.com/quinnjr/pass-sys"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["pass", "password-store", "gpg", "unix"]
+categories = ["api-bindings", "os::unix-apis"]
+
+[dependencies]
+gpgme = "0.11"
+tempfile = "3"
+zeroize = "1"
+
+[dev-dependencies]
+libc = "0.2"
