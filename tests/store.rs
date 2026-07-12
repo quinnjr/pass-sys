@@ -705,3 +705,14 @@ fn init_reencrypts_non_utf8_entries() {
         vec![f.encryption_keyid(TEST_KEY_ID_2)]
     );
 }
+
+#[test]
+fn reencrypted_entries_are_readable_by_pass() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("interop", "hunter2\n").unwrap();
+    s.init(&[TEST_KEY_ID_2]).unwrap();
+    let shown = f.pass_cli(&["show", "interop"]).expect("pass show");
+    assert_eq!(shown, "hunter2\n");
+}
