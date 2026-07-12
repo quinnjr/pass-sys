@@ -169,14 +169,89 @@ impl PasswordStore {
 
     /// Initialize the store for the given GPG ids, creating the store
     /// directory (mode `0o700`) and writing `.gpg-id`.
+    ///
+    /// If the store already contains entries and the id set changes, every
+    /// entry governed by the root `.gpg-id` (i.e. not inside a subfolder
+    /// with its own non-empty `.gpg-id`) is re-encrypted to the new ids,
+    /// like `pass init`. All new ids must resolve to keys before anything
+    /// is modified. Entries are re-encrypted one at a time (each write
+    /// atomic) and `.gpg-id` is written last, so an interrupted run is
+    /// fully repaired by running `init` again with the same ids.
     pub fn init(&self, gpg_ids: &[&str]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+        let new_ids: Vec<String> = gpg_ids.iter().map(|id| id.to_string()).collect();
+        let old_ids = self.root_gpg_ids()?;
         fs::create_dir_all(&self.store_dir)?;
         fs::set_permissions(&self.store_dir, fs::Permissions::from_mode(0o700))?;
-        let mut contents = gpg_ids.join("\n");
+
+        if old_ids.as_deref() != Some(&new_ids[..]) {
+            let entries = self.governed_entries()?;
+            if !entries.is_empty() {
+                let mut ctx = self.context()?;
+                // Fail fast: resolve every new key before touching any entry.
+                let keys = self.keys_for_ids(&mut ctx, &new_ids)?;
+                for name in &entries {
+                    let plaintext = self.decrypt_raw(&mut ctx, name)?;
+                    let path = self.entry_path(name)?;
+                    self.write_encrypted(&mut ctx, &keys, &plaintext, &path)?;
+                }
+            }
+        }
+
+        let mut contents = new_ids.join("\n");
         contents.push('\n');
         fs::write(self.store_dir.join(".gpg-id"), contents)?;
         Ok(())
+    }
+
+    /// The root `.gpg-id`'s ids, or `None` if absent or empty (matching
+    /// `gpg_ids_for`'s treatment of empty files). Unreadable is a hard error.
+    fn root_gpg_ids(&self) -> Result<Option<Vec<String>>> {
+        match fs::read_to_string(self.store_dir.join(".gpg-id")) {
+            Ok(contents) => {
+                let ids = parse_gpg_ids(&contents);
+                Ok((!ids.is_empty()).then_some(ids))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    /// Entry names governed by the root `.gpg-id`: the whole tree minus
+    /// subfolders that declare their own non-empty `.gpg-id` (separate
+    /// domains, like `pass init` leaves alone). Returns empty when the
+    /// store directory doesn't exist yet.
+    fn governed_entries(&self) -> Result<Vec<String>> {
+        fn walk(dir: &Path, prefix: &str, entries: &mut Vec<String>) -> Result<()> {
+            for item in fs::read_dir(dir).map_err(Error::Io)? {
+                let item = item.map_err(Error::Io)?;
+                let file_name = item.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                if item.file_type().map_err(Error::Io)?.is_dir() {
+                    match fs::read_to_string(item.path().join(".gpg-id")) {
+                        Ok(contents) if !parse_gpg_ids(&contents).is_empty() => continue,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        // A present-but-unreadable .gpg-id must never be
+                        // treated as absent (wrong-recipient hazard).
+                        Err(e) => return Err(Error::Io(e)),
+                    }
+                    walk(&item.path(), &format!("{prefix}{file_name}/"), entries)?;
+                } else if let Some(name) = file_name.strip_suffix(".gpg") {
+                    entries.push(format!("{prefix}{name}"));
+                }
+            }
+            Ok(())
+        }
+        let mut entries = Vec::new();
+        if self.store_dir.is_dir() {
+            walk(&self.store_dir, "", &mut entries)?;
+        }
+        entries.sort();
+        Ok(entries)
     }
 
     /// Decrypt an entry and return its full contents.

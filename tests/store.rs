@@ -575,6 +575,53 @@ fn gpg_home_getter_reflects_configuration() {
 }
 
 #[test]
+fn init_reencrypts_existing_entries_to_new_ids() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    s.insert("sub/deeper", "nested\n").unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init");
+    assert_eq!(
+        f.recipient_keyids("entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+    assert_eq!(
+        f.recipient_keyids("sub/deeper"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+    assert_eq!(s.show("entry").unwrap(), "secret\n");
+}
+
+#[test]
+fn init_with_unchanged_ids_leaves_entries_untouched() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    s.init(&[TEST_KEY_ID]).expect("no-op re-init");
+    let after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(before, after, "unchanged id set must not rewrite entries");
+}
+
+#[test]
+fn init_with_missing_key_fails_before_mutating_anything() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let entry_before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    let err = s.init(&["nobody@pass-sys.test.invalid"]).unwrap_err();
+    assert!(
+        matches!(err, pass_sys::Error::KeyNotFound(ref id) if id == "nobody@pass-sys.test.invalid"),
+        "expected KeyNotFound, got: {err:?}"
+    );
+    let gpg_id = std::fs::read_to_string(f.store_dir().join(".gpg-id")).unwrap();
+    assert_eq!(gpg_id.trim(), TEST_KEY_ID, ".gpg-id must be unchanged");
+    let entry_after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(entry_before, entry_after, "entries must be unchanged");
+}
+
+#[test]
 fn doc_example_flow_works_end_to_end() {
     // The crate-level doctest is no_run (it targets the user's real store);
     // this mirrors the same sequence against the fixture.
