@@ -116,7 +116,9 @@ Behavior follows `pass` where it matters:
 
 - Recipients come from the nearest `.gpg-id` at or above an entry, so
   per-subfolder key sets work. An unreadable `.gpg-id` is a hard error,
-  never a silent fallback to the parent's keys.
+  never a silent fallback to the parent's keys. Re-running `init` with a
+  changed id set re-encrypts every entry the root `.gpg-id` governs
+  (subfolders with their own `.gpg-id` are left alone), like `pass init`.
 - Encryption requires **every** id listed in `.gpg-id` to resolve to a key;
   a missing recipient fails with `Error::KeyNotFound` rather than silently
   encrypting to fewer keys.
@@ -129,8 +131,7 @@ Behavior follows `pass` where it matters:
   `pass generate` (`[:graph:]`, or `[:alnum:]` with `generate_alphanumeric`).
 
 **Not implemented** (deliberately, for now): git integration (`pass git`),
-extensions, re-encryption of existing entries on `init`, and non-UTF-8 entry
-contents (`show` returns `String`).
+extensions, and non-UTF-8 entry contents (`show` returns `String`).
 
 ## Security posture
 

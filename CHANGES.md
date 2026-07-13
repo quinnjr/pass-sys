@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-13
+
+### Changed
+
+- `init` now re-encrypts existing entries governed by the root `.gpg-id`
+  when the id set changes, matching `pass init`. All new ids must resolve
+  to keys before anything is modified; `.gpg-id` is written last so an
+  interrupted re-encryption is repaired by re-running `init`. Non-UTF-8
+  entries are re-encrypted correctly (the re-encryption path is raw
+  bytes).
+- `init` rejects an empty or whitespace-only id set with `Error::NoGpgIds`
+  instead of proceeding (which would have fallen through to symmetric
+  encryption during re-encryption).
+
 ## [0.1.1] - 2026-07-12
 
 ### Changed

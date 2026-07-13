@@ -63,6 +63,8 @@ pub enum Error {
     KeyNotFound(String),
     /// The entry name would resolve outside the password store.
     SneakyPath(String),
+    /// `init` was called with no usable GPG ids.
+    NoGpgIds,
 }
 
 impl fmt::Display for Error {
@@ -81,6 +83,7 @@ impl fmt::Display for Error {
             }
             Error::KeyNotFound(id) => write!(f, "no GPG key found for id {id}"),
             Error::SneakyPath(name) => write!(f, "entry name {name} escapes the password store"),
+            Error::NoGpgIds => write!(f, "no GPG ids given: a store needs at least one recipient"),
         }
     }
 }
@@ -105,6 +108,16 @@ impl From<std::io::Error> for Error {
 /// Wrap a gpgme error without leaking the `gpgme` type into the public API.
 fn gpg_err(e: gpgme::Error) -> Error {
     Error::Gpg(Box::new(e))
+}
+
+/// Parse a `.gpg-id` file's contents into its non-empty, trimmed id lines.
+fn parse_gpg_ids(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -159,14 +172,94 @@ impl PasswordStore {
 
     /// Initialize the store for the given GPG ids, creating the store
     /// directory (mode `0o700`) and writing `.gpg-id`.
+    ///
+    /// If the store already contains entries and the id set changes, every
+    /// entry governed by the root `.gpg-id` (i.e. not inside a subfolder
+    /// with its own non-empty `.gpg-id`) is re-encrypted to the new ids,
+    /// like `pass init`. All new ids must resolve to keys before anything
+    /// is modified. Entries are re-encrypted one at a time (each write
+    /// atomic) and `.gpg-id` is written last, so an interrupted run is
+    /// repaired by running `init` again with the same ids (provided a
+    /// secret key for one of the new ids is available to decrypt the
+    /// already-converted entries).
     pub fn init(&self, gpg_ids: &[&str]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+        let new_ids: Vec<String> = gpg_ids.iter().map(|id| id.trim().to_owned()).collect();
+        if new_ids.is_empty() || new_ids.iter().any(String::is_empty) {
+            return Err(Error::NoGpgIds);
+        }
+        let old_ids = self.root_gpg_ids()?;
         fs::create_dir_all(&self.store_dir)?;
         fs::set_permissions(&self.store_dir, fs::Permissions::from_mode(0o700))?;
-        let mut contents = gpg_ids.join("\n");
+
+        if old_ids.as_deref() != Some(&new_ids[..]) {
+            let entries = self.governed_entries()?;
+            if !entries.is_empty() {
+                let mut ctx = self.context()?;
+                // Fail fast: resolve every new key before touching any entry.
+                let keys = self.keys_for_ids(&mut ctx, &new_ids)?;
+                for name in &entries {
+                    let plaintext = self.decrypt_raw(&mut ctx, name)?;
+                    let path = self.entry_path(name)?;
+                    self.write_encrypted(&mut ctx, &keys, &plaintext, &path)?;
+                }
+            }
+        }
+
+        let mut contents = new_ids.join("\n");
         contents.push('\n');
         fs::write(self.store_dir.join(".gpg-id"), contents)?;
         Ok(())
+    }
+
+    /// The root `.gpg-id`'s ids, or `None` if absent or empty (matching
+    /// `gpg_ids_for`'s treatment of empty files). Unreadable is a hard error.
+    fn root_gpg_ids(&self) -> Result<Option<Vec<String>>> {
+        match fs::read_to_string(self.store_dir.join(".gpg-id")) {
+            Ok(contents) => {
+                let ids = parse_gpg_ids(&contents);
+                Ok((!ids.is_empty()).then_some(ids))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    /// Entry names governed by the root `.gpg-id`: the whole tree minus
+    /// subfolders that declare their own non-empty `.gpg-id` (separate
+    /// domains, like `pass init` leaves alone). Returns empty when the
+    /// store directory doesn't exist yet.
+    fn governed_entries(&self) -> Result<Vec<String>> {
+        fn walk(dir: &Path, prefix: &str, entries: &mut Vec<String>) -> Result<()> {
+            for item in fs::read_dir(dir).map_err(Error::Io)? {
+                let item = item.map_err(Error::Io)?;
+                let file_name = item.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                if item.file_type().map_err(Error::Io)?.is_dir() {
+                    match fs::read_to_string(item.path().join(".gpg-id")) {
+                        Ok(contents) if !parse_gpg_ids(&contents).is_empty() => continue,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        // A present-but-unreadable .gpg-id must never be
+                        // treated as absent (wrong-recipient hazard).
+                        Err(e) => return Err(Error::Io(e)),
+                    }
+                    walk(&item.path(), &format!("{prefix}{file_name}/"), entries)?;
+                } else if let Some(name) = file_name.strip_suffix(".gpg") {
+                    entries.push(format!("{prefix}{name}"));
+                }
+            }
+            Ok(())
+        }
+        let mut entries = Vec::new();
+        if self.store_dir.is_dir() {
+            walk(&self.store_dir, "", &mut entries)?;
+        }
+        entries.sort();
+        Ok(entries)
     }
 
     /// Decrypt an entry and return its full contents.
@@ -191,7 +284,7 @@ impl PasswordStore {
         self.insert_with(&mut ctx, name, contents)
     }
 
-    fn show_with(&self, ctx: &mut gpgme::Context, name: &str) -> Result<String> {
+    fn decrypt_raw(&self, ctx: &mut gpgme::Context, name: &str) -> Result<Zeroizing<Vec<u8>>> {
         let path = self.entry_path(name)?;
         let ciphertext = fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Error::NotFound(name.to_owned()),
@@ -199,20 +292,21 @@ impl PasswordStore {
         })?;
         let mut plaintext = Zeroizing::new(Vec::new());
         ctx.decrypt(&ciphertext, &mut *plaintext).map_err(gpg_err)?;
+        Ok(plaintext)
+    }
+
+    fn show_with(&self, ctx: &mut gpgme::Context, name: &str) -> Result<String> {
+        let plaintext = self.decrypt_raw(ctx, name)?;
         let text = std::str::from_utf8(&plaintext).map_err(Error::Utf8)?;
         Ok(text.to_owned())
     }
 
-    fn insert_with(&self, ctx: &mut gpgme::Context, name: &str, contents: &str) -> Result<()> {
-        let path = self.entry_path(name)?;
-        let parent = path.parent().expect("entry path always has a parent");
-        let ids = self.gpg_ids_for(parent)?;
-
+    fn keys_for_ids(&self, ctx: &mut gpgme::Context, ids: &[String]) -> Result<Vec<gpgme::Key>> {
         // Looked up per id, not batched via find_keys: a batched lookup
         // cannot attribute matches to patterns, so a missing recipient
         // would silently encrypt to fewer keys than .gpg-id demands.
         let mut keys = Vec::with_capacity(ids.len());
-        for id in &ids {
+        for id in ids {
             let key = ctx.get_key(id.as_str()).map_err(|e| {
                 // gpgme reports an absent key as EOF; anything else (agent
                 // down, corrupt keyring) is a real gpg failure.
@@ -224,9 +318,19 @@ impl PasswordStore {
             })?;
             keys.push(key);
         }
+        Ok(keys)
+    }
 
+    fn write_encrypted(
+        &self,
+        ctx: &mut gpgme::Context,
+        keys: &[gpgme::Key],
+        plaintext: &[u8],
+        path: &Path,
+    ) -> Result<()> {
+        let parent = path.parent().expect("entry path always has a parent");
         let mut ciphertext = Vec::new();
-        ctx.encrypt(&keys, contents, &mut ciphertext)
+        ctx.encrypt(keys, plaintext, &mut ciphertext)
             .map_err(gpg_err)?;
         fs::create_dir_all(parent)?;
         // Atomic replace: write a temp file (created 0o600) in the same
@@ -234,8 +338,16 @@ impl PasswordStore {
         // can never truncate an existing entry.
         let tmp = tempfile::NamedTempFile::new_in(parent)?;
         fs::write(tmp.path(), &ciphertext)?;
-        tmp.persist(&path).map_err(|e| Error::Io(e.error))?;
+        tmp.persist(path).map_err(|e| Error::Io(e.error))?;
         Ok(())
+    }
+
+    fn insert_with(&self, ctx: &mut gpgme::Context, name: &str, contents: &str) -> Result<()> {
+        let path = self.entry_path(name)?;
+        let parent = path.parent().expect("entry path always has a parent");
+        let ids = self.gpg_ids_for(parent)?;
+        let keys = self.keys_for_ids(ctx, &ids)?;
+        self.write_encrypted(ctx, &keys, contents.as_bytes(), &path)
     }
 
     /// Delete an entry from the store.
@@ -421,12 +533,7 @@ impl PasswordStore {
             let gpg_id = current.join(".gpg-id");
             match fs::read_to_string(&gpg_id) {
                 Ok(contents) => {
-                    let ids: Vec<String> = contents
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_owned)
-                        .collect();
+                    let ids = parse_gpg_ids(&contents);
                     if !ids.is_empty() {
                         return Ok(ids);
                     }

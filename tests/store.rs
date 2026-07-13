@@ -575,6 +575,53 @@ fn gpg_home_getter_reflects_configuration() {
 }
 
 #[test]
+fn init_reencrypts_existing_entries_to_new_ids() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    s.insert("sub/deeper", "nested\n").unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init");
+    assert_eq!(
+        f.recipient_keyids("entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+    assert_eq!(
+        f.recipient_keyids("sub/deeper"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+    assert_eq!(s.show("entry").unwrap(), "secret\n");
+}
+
+#[test]
+fn init_with_unchanged_ids_leaves_entries_untouched() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    s.init(&[TEST_KEY_ID]).expect("no-op re-init");
+    let after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(before, after, "unchanged id set must not rewrite entries");
+}
+
+#[test]
+fn init_with_missing_key_fails_before_mutating_anything() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let entry_before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    let err = s.init(&["nobody@pass-sys.test.invalid"]).unwrap_err();
+    assert!(
+        matches!(err, pass_sys::Error::KeyNotFound(ref id) if id == "nobody@pass-sys.test.invalid"),
+        "expected KeyNotFound, got: {err:?}"
+    );
+    let gpg_id = std::fs::read_to_string(f.store_dir().join(".gpg-id")).unwrap();
+    assert_eq!(gpg_id.trim(), TEST_KEY_ID, ".gpg-id must be unchanged");
+    let entry_after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(entry_before, entry_after, "entries must be unchanged");
+}
+
+#[test]
 fn doc_example_flow_works_end_to_end() {
     // The crate-level doctest is no_run (it targets the user's real store);
     // this mirrors the same sequence against the fixture.
@@ -588,4 +635,123 @@ fn doc_example_flow_works_end_to_end() {
         "hunter2\nusername: joseph\n"
     );
     assert_eq!(s.list().unwrap(), vec!["web/example.com"]);
+}
+
+#[test]
+fn init_does_not_cross_gpg_id_domains() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    std::fs::create_dir_all(f.store_dir().join("sub")).unwrap();
+    std::fs::write(
+        f.store_dir().join("sub/.gpg-id"),
+        format!("{TEST_KEY_ID_2}\n"),
+    )
+    .unwrap();
+    s.insert("root-entry", "a\n").unwrap();
+    s.insert("sub/entry", "b\n").unwrap();
+    let sub_before = std::fs::read(f.store_dir().join("sub/entry.gpg")).unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init root");
+    assert_eq!(
+        f.recipient_keyids("root-entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "root domain must be re-encrypted"
+    );
+    assert_eq!(
+        f.recipient_keyids("sub/entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "sub domain has its own .gpg-id and must NOT be touched — same key here, so assert via file bytes instead"
+    );
+    let sub_after = std::fs::read(f.store_dir().join("sub/entry.gpg")).unwrap();
+    assert_eq!(sub_before, sub_after, "sub-domain entry must be untouched");
+}
+
+#[test]
+fn init_skips_subfolder_with_own_gpg_id_but_covers_empty_one() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    // own domain: must not be rewritten by root re-init
+    std::fs::create_dir_all(f.store_dir().join("own")).unwrap();
+    std::fs::write(
+        f.store_dir().join("own/.gpg-id"),
+        format!("{TEST_KEY_ID}\n"),
+    )
+    .unwrap();
+    s.insert("own/entry", "a\n").unwrap();
+    // empty .gpg-id: governed by root, must be rewritten
+    std::fs::create_dir_all(f.store_dir().join("empty")).unwrap();
+    std::fs::write(f.store_dir().join("empty/.gpg-id"), "\n").unwrap();
+    s.insert("empty/entry", "b\n").unwrap();
+
+    let own_before = std::fs::read(f.store_dir().join("own/entry.gpg")).unwrap();
+    s.init(&[TEST_KEY_ID_2]).expect("re-init root");
+    let own_after = std::fs::read(f.store_dir().join("own/entry.gpg")).unwrap();
+
+    assert_eq!(own_before, own_after, "own-domain entry must be untouched");
+    assert_eq!(
+        f.recipient_keyids("empty/entry"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)],
+        "empty .gpg-id folder is governed by the root and must be re-encrypted"
+    );
+}
+
+#[test]
+fn init_reencrypts_non_utf8_entries() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    f.encrypt_raw("binary", &[0xff, 0xfe, 0x00, 0x80]);
+    s.init(&[TEST_KEY_ID_2]).expect("re-init with binary entry");
+    assert_eq!(
+        f.recipient_keyids("binary"),
+        vec![f.encryption_keyid(TEST_KEY_ID_2)]
+    );
+}
+
+#[test]
+fn reencrypted_entries_are_readable_by_pass() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("interop", "hunter2\n").unwrap();
+    s.init(&[TEST_KEY_ID_2]).unwrap();
+    let shown = f.pass_cli(&["show", "interop"]).expect("pass show");
+    assert_eq!(shown, "hunter2\n");
+}
+
+#[test]
+fn init_with_no_usable_ids_is_rejected() {
+    let f = Fixture::new();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    let entry_before = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    for ids in [&[][..], &[""][..], &["   "][..]] {
+        let err = s.init(ids).unwrap_err();
+        assert!(
+            matches!(err, pass_sys::Error::NoGpgIds),
+            "expected NoGpgIds for {ids:?}, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "no GPG ids given: a store needs at least one recipient"
+        );
+    }
+    let gpg_id = std::fs::read_to_string(f.store_dir().join(".gpg-id")).unwrap();
+    assert_eq!(gpg_id.trim(), TEST_KEY_ID, ".gpg-id must be unchanged");
+    let entry_after = std::fs::read(f.store_dir().join("entry.gpg")).unwrap();
+    assert_eq!(entry_before, entry_after, "entries must be unchanged");
+}
+
+#[test]
+fn init_reencrypts_to_multiple_ids() {
+    let f = Fixture::new();
+    f.gen_second_key();
+    let s = initialized(&f);
+    s.insert("entry", "secret\n").unwrap();
+    s.init(&[TEST_KEY_ID, TEST_KEY_ID_2])
+        .expect("re-init to two ids");
+    let recipients = f.recipient_keyids("entry");
+    assert!(recipients.contains(&f.encryption_keyid(TEST_KEY_ID)));
+    assert!(recipients.contains(&f.encryption_keyid(TEST_KEY_ID_2)));
 }
